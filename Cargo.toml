@@ -1,0 +1,17 @@
+[package]
+name = "moremath"
+version = "0.1.0"
+edition = "2024"
+description = "Numbers beyond the standard library: bf16, f16, tf32, u1/u4/i4 -- bit patterns, IEEE rounding and conversions (no_std)"
+license = "GPL-2.0-only"
+repository = "https://github.com/Jabberwocky238/moremath"
+categories = ["mathematics", "no-std"]
+keywords = ["bf16", "f16", "tf32", "float", "rounding"]
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+doc_markdown = "allow"
+must_use_candidate = "allow"
