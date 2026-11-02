@@ -17,3 +17,16 @@ use moremath::transquant;
 assert_eq!(transquant!(0x3f80_8000u32, u32 to f32 to bf16 to u16), 0x3f80); // tie to even
 assert_eq!(transquant!(1.0f64 + 1e-9, f64 to bf16 with TowardZero to u16), 0x3f80);
 ```
+
+## Bits and small syntax
+
+| macro | what |
+| --- | --- |
+| `bit![word, [12..=15]]` / `bit![word, [12..=15], u8]` | read a bit field by its datasheet indices (low first, `=` required; `[12..16]` is a compile error); typed form panics when the field does not fit |
+| `pack![u32, [25..=31] = f7, [0..=6] = 0x2b]` | build a word from its fields; overlaps / out-of-width / literal overflow are compile errors, a variable that does not fit panics naming its field; works in `const fn` |
+| `pick!(b == 0 ? u32::MAX : a / b)` | C's conditional operator, both arms lazy |
+| `declare_error! { @name E  Group { V { x: u32 } => "{x}", ... } }` | an error table into a `thiserror` enum (the caller depends on `thiserror`) |
+
+`bit!` / `pack!` / `pick!` live in the `moremath-macros` proc-macro crate and are re-exported here;
+depend on `moremath` only.
+

@@ -1,0 +1,18 @@
+[package]
+name = "moremath-macros"
+version.workspace = true
+edition = "2024"
+description = "moremath 的 proc-macro：bit! / pack! / pick!（位段取值、位段拼字、条件运算符）"
+license = "MIT"
+repository = "https://github.com/Jabberwocky238/moremath"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[lints]
+workspace = true
