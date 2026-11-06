@@ -9,7 +9,7 @@ categories = ["mathematics", "no-std"]
 keywords = ["bf16", "f16", "tf32", "float", "bitfield"]
 
 [dependencies]
-moremath-macros = { path = "macros", version = "=0.2.0" }
+moremath-macros = { path = "macros", version = "=0.2.1" }
 
 [features]
 # `Execute` / `Executor` (`parallel.rs`): a batch of tasks in, their outputs in a `Vec`;
@@ -25,7 +25,7 @@ workspace = true
 members = ["macros"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

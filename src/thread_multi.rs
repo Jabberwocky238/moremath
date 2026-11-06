@@ -1,10 +1,17 @@
 //! [`ThreadMulti`]: the pool side of [`ThreadSingle`](crate::ThreadSingle) — the same
 //! [`Executor`], lock-free, over a pool of OS threads started once and reused by every
-//! [`execute`](Executor::execute). A call waits for every pool thread before it
-//! returns, so its tasks may borrow anything that outlives the call.
+//! [`execute`](Executor::execute).
 //!
-//! Nothing here locks: a batch is published through atomics, each task is handed to one worker
-//! by `fetch_add`, and threads sleep and wake with `park` / `unpark`.
+//! Calls nest: a task may call [`execute`](Executor::execute) again, so work splits into smaller
+//! tasks as deep as it likes. Every call in flight is a *batch* listed in a fixed table; a
+//! thread with nothing to do takes the next untaken task of any listed batch. The caller of a
+//! batch takes its own tasks first, then helps the other batches until its own are done, so a
+//! nested call never idles a worker.
+//!
+//! Nothing locks: tasks are handed out by `fetch_add`, batches listed with compare-and-swap,
+//! and threads sleep and wake with `park` / `unpark`. A call returns only once all its tasks are
+//! done and no thread looks at its batch any more, so tasks may borrow anything that outlives
+//! the call.
 
 use crate::{Execute, Executor};
 use alloc::boxed::Box;
@@ -21,16 +28,12 @@ use std::thread::{JoinHandle, Thread};
 /// A task's panic, carried to the caller.
 type Panic = Box<dyn Any + Send>;
 
-/// ⭐ A thread pool as an [`Executor`]. `n` workers: `n − 1` pool threads and the calling
-/// thread. Each worker takes the next task not yet taken, so uneven tasks spread over them.
-///
-/// One batch runs on the pool at a time: a call made while another runs (from another thread,
-/// or from inside one of its tasks) runs its own tasks on its own thread, one after another.
+/// ⭐ A thread pool as an [`Executor`]. `n` workers: `n − 1` pool threads and whichever thread
+/// calls. Calls nest (a task may [`execute`](Executor::execute) more tasks); each worker takes
+/// the next task not yet taken, so uneven tasks spread over them.
 pub struct ThreadMulti {
     shared: Arc<Shared>,
     pool: Vec<JoinHandle<()>>,
-    /// A batch is on the pool.
-    running: AtomicBool,
 }
 
 impl Default for ThreadMulti {
@@ -50,7 +53,7 @@ impl From<NonZeroUsize> for ThreadMulti {
                 std::thread::spawn(move || shared.serve())
             })
             .collect();
-        Self { shared, pool, running: AtomicBool::new(false) }
+        Self { shared, pool }
     }
 }
 
@@ -62,32 +65,21 @@ impl Executor for ThreadMulti {
     }
 
     fn execute<'x, 't, E: Execute<'t>>(&'x self, tasks: Vec<E>) -> Vec<E::Output> {
-        if self.pool.is_empty() || tasks.len() <= 1 || self.running.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if self.pool.is_empty() || tasks.len() <= 1 {
             return tasks.into_iter().map(Execute::execute).collect();
         }
-        let _running = Running(&self.running);
-        let slots: Vec<Slot<'t, E>> = tasks.into_iter().map(Slot::from).collect();
-        let next = AtomicUsize::new(0);
-        let work = || {
-            while let Some(slot) = slots.get(next.fetch_add(1, Ordering::Relaxed)) {
-                slot.run();
+        let batch = Batch::from(tasks);
+        // With the table full, the caller runs its batch alone.
+        if let Some(entry) = self.shared.list(&batch.header) {
+            let listed = Listed { shared: &self.shared, entry, batch: &batch };
+            for t in &self.pool {
+                t.thread().unpark();
             }
-        };
-        let batch = Batch { work: &work, caller: std::thread::current(), busy: AtomicUsize::new(self.pool.len()), panic: AtomicPtr::new(ptr::null_mut()) };
-        // From here the pool threads hold `batch`: whatever happens, wait for them.
-        let waiting = Waiting(&batch);
-        self.shared.job.store(ptr::from_ref(&batch).cast_mut().cast(), Ordering::Release);
-        self.shared.batch.fetch_add(1, Ordering::Release);
-        for t in &self.pool {
-            t.thread().unpark();
+            drop(listed);
+        } else {
+            while batch.help() {}
         }
-        work();
-        batch.wait();
-        if let Some(p) = batch.take_panic() {
-            resume_unwind(p);
-        }
-        drop(waiting);
-        slots.into_iter().map(Slot::output).collect()
+        batch.outputs()
     }
 }
 
@@ -96,67 +88,149 @@ impl Drop for ThreadMulti {
         self.shared.quit.store(true, Ordering::Release);
         for t in self.pool.drain(..) {
             t.thread().unpark();
-            // A pool thread never panics: a task's panic is caught and resumed in the caller.
+            // A pool thread never panics: a task's panic is caught and resumed in its caller.
             let _ = t.join();
         }
     }
 }
 
-/// What the pool threads and [`ThreadMulti`] share.
-#[derive(Default)]
+/// How many batches may be in flight at once; a call past that runs its tasks alone.
+const ENTRIES: usize = 64;
+
+/// What the pool threads and every caller share: the batches in flight.
 struct Shared {
-    /// Counts batches, so a pool thread joins each one once.
-    batch: AtomicUsize,
-    /// The current [`Batch`], published before `batch` counts it.
-    job: AtomicPtr<()>,
+    entries: Box<[Entry]>,
     quit: AtomicBool,
 }
 
+impl Default for Shared {
+    fn default() -> Self {
+        Self { entries: (0..ENTRIES).map(|_| Entry::default()).collect(), quit: AtomicBool::new(false) }
+    }
+}
+
+/// One place in the table: a listed batch (or null), and how many threads may be looking at it.
+/// A thread counts itself in `users` before it reads `batch`; the caller clears `batch`, then
+/// waits for `users` to drain, so no thread reads a batch that is gone.
+#[derive(Default)]
+struct Entry {
+    batch: AtomicPtr<Header>,
+    users: AtomicUsize,
+}
+
 impl Shared {
-    /// A pool thread: joins each batch once, until told to quit.
+    /// Lists `batch` in a free entry.
+    fn list(&self, batch: &Header) -> Option<&Entry> {
+        let p = ptr::from_ref(batch).cast_mut();
+        self.entries.iter().find(|e| e.batch.compare_exchange(ptr::null_mut(), p, Ordering::SeqCst, Ordering::Relaxed).is_ok())
+    }
+
+    /// Takes and runs one task of any listed batch; `false` when none is left untaken.
+    fn help(&self) -> bool {
+        self.entries.iter().any(|e| {
+            if e.batch.load(Ordering::Relaxed).is_null() {
+                return false;
+            }
+            e.users.fetch_add(1, Ordering::SeqCst);
+            let p = e.batch.load(Ordering::SeqCst);
+            // SAFETY: counted in `users`, so the batch behind a non-null `p` stays listed and
+            // alive until the count drops (`Listed::drop`).
+            let ran = !p.is_null() && unsafe { ((*p).help)(p) };
+            e.users.fetch_sub(1, Ordering::SeqCst);
+            ran
+        })
+    }
+
+    /// A pool thread: helps while there is work, sleeps when there is none, until told to quit.
     fn serve(&self) {
-        let mut seen = 0;
-        loop {
-            let now = self.batch.load(Ordering::Acquire);
-            if self.quit.load(Ordering::Acquire) {
-                return;
-            }
-            if now == seen {
+        while !self.quit.load(Ordering::Acquire) {
+            if !self.help() {
                 std::thread::park();
-                continue;
-            }
-            seen = now;
-            // SAFETY: a batch waits for every pool thread to count itself out of `busy` before
-            // it returns, so the `Batch` behind `job` lives at least until `busy` is decremented.
-            let batch = unsafe { &*self.job.load(Ordering::Acquire).cast::<Batch<'_>>() };
-            if let Err(p) = catch_unwind(AssertUnwindSafe(batch.work)) {
-                batch.keep(p);
-            }
-            // Past the decrement the batch may be gone: take the caller's handle first.
-            let caller = batch.caller.clone();
-            if batch.busy.fetch_sub(1, Ordering::AcqRel) == 1 {
-                caller.unpark();
             }
         }
     }
 }
 
-/// One batch on the pool, on the caller's stack.
-struct Batch<'w> {
-    work: &'w (dyn Fn() + Sync),
+/// A batch while it is listed. Dropped — even while unwinding — it waits for the batch: the
+/// caller takes its own untaken tasks first, then helps any listed batch (or sleeps, until the
+/// last task done wakes it) while its own tasks still run elsewhere; then it unlists the batch
+/// and waits until no thread looks at it.
+struct Listed<'s, 'b, 't, E: Execute<'t>> {
+    shared: &'s Shared,
+    entry: &'s Entry,
+    batch: &'b Batch<'t, E>,
+}
+
+impl<'t, E: Execute<'t>> Drop for Listed<'_, '_, 't, E> {
+    fn drop(&mut self) {
+        while self.batch.help() {}
+        while !self.batch.done() {
+            if !self.shared.help() {
+                std::thread::park();
+            }
+        }
+        self.entry.batch.store(ptr::null_mut(), Ordering::SeqCst);
+        while self.entry.users.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// What the table holds of a batch: how to run one of its tasks, whatever its type.
+struct Header {
+    /// [`Batch::help`] of the batch this header starts.
+    help: unsafe fn(*const Header) -> bool,
+}
+
+/// One call's tasks, on the caller's stack. `header` comes first, so a `*const Header` from the
+/// table is a `*const Batch`.
+#[repr(C)]
+struct Batch<'t, E: Execute<'t>> {
+    header: Header,
+    slots: Vec<Slot<'t, E>>,
+    /// The next task to hand out.
+    next: AtomicUsize,
+    /// Tasks not done yet.
+    pending: AtomicUsize,
+    /// Woken when the last task is done.
     caller: Thread,
-    /// Pool threads not done with `work` yet.
-    busy: AtomicUsize,
-    /// The first panic a pool thread caught (`Box<Panic>` raw, or null).
+    /// The first panic a task raised (`Box<Panic>` raw, or null).
     panic: AtomicPtr<Panic>,
 }
 
-impl Batch<'_> {
-    /// Waits until no pool thread is in the batch any more.
-    fn wait(&self) {
-        while self.busy.load(Ordering::Acquire) != 0 {
-            std::thread::park();
+impl<'t, E: Execute<'t>> From<Vec<E>> for Batch<'t, E> {
+    fn from(tasks: Vec<E>) -> Self {
+        let pending = AtomicUsize::new(tasks.len());
+        let slots = tasks.into_iter().map(Slot::from).collect();
+        Self { header: Header { help: Self::help_erased }, slots, next: AtomicUsize::new(0), pending, caller: std::thread::current(), panic: AtomicPtr::new(ptr::null_mut()) }
+    }
+}
+
+impl<'t, E: Execute<'t>> Batch<'t, E> {
+    /// [`Batch::help`] reached through the table.
+    ///
+    /// # Safety
+    /// `h` is the header of a live `Batch<'t, E>`.
+    unsafe fn help_erased(h: *const Header) -> bool {
+        // SAFETY: `#[repr(C)]` with `header` first; the caller vouches it is alive.
+        unsafe { &*h.cast::<Self>() }.help()
+    }
+
+    /// Takes and runs the next untaken task; `false` when none is left. A panic is kept for the
+    /// caller; the last task done wakes it.
+    fn help(&self) -> bool {
+        let Some(slot) = self.slots.get(self.next.fetch_add(1, Ordering::Relaxed)) else { return false };
+        if let Err(p) = catch_unwind(AssertUnwindSafe(|| slot.run())) {
+            self.keep(p);
         }
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.caller.unpark();
+        }
+        true
+    }
+
+    fn done(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
     }
 
     /// Keeps `p` unless a panic is kept already.
@@ -168,29 +242,14 @@ impl Batch<'_> {
         }
     }
 
-    fn take_panic(&self) -> Option<Panic> {
+    /// The outputs in task order, or the first panic resumed. Every task is done.
+    fn outputs(self) -> Vec<E::Output> {
         let p = self.panic.swap(ptr::null_mut(), Ordering::Acquire);
-        // SAFETY: a non-null `panic` came from `Box::into_raw` in `keep`; the swap took it.
-        (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
-    }
-}
-
-/// Waits for the pool threads when dropped, even while the caller unwinds.
-struct Waiting<'b, 'w>(&'b Batch<'w>);
-
-impl Drop for Waiting<'_, '_> {
-    fn drop(&mut self) {
-        self.0.wait();
-        drop(self.0.take_panic());
-    }
-}
-
-/// Clears [`ThreadMulti::running`] when dropped.
-struct Running<'r>(&'r AtomicBool);
-
-impl Drop for Running<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        if !p.is_null() {
+            // SAFETY: a non-null `panic` came from `Box::into_raw` in `keep`; the swap took it.
+            resume_unwind(*unsafe { Box::from_raw(p) });
+        }
+        self.slots.into_iter().map(Slot::output).collect()
     }
 }
 
@@ -204,7 +263,7 @@ enum Stage<'t, E: Execute<'t>> {
 }
 
 // SAFETY: a slot is touched only by the one worker its index was handed to, and read back by
-// the caller only after every worker is done; the task and its output are `Send`.
+// the caller only after every task is done; the task and its output are `Send`.
 unsafe impl<'t, E: Execute<'t>> Sync for Slot<'t, E> {}
 
 impl<'t, E: Execute<'t>> From<E> for Slot<'t, E> {
