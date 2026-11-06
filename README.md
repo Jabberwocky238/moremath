@@ -18,6 +18,16 @@ assert_eq!(transquant!(0x3f80_8000u32, u32 to f32 to bf16 to u16), 0x3f80); // t
 assert_eq!(transquant!(1.0f64 + 1e-9, f64 to bf16 with TowardZero to u16), 0x3f80);
 ```
 
+## Running tasks
+
+An `Execute` is one task (any `FnOnce() -> T + Send` is one); an `Executor` runs a `Vec` of them
+and returns their outputs in task order. Two executors implement the same traits side by side:
+
+| executor | feature | runs tasks |
+| --- | --- | --- |
+| `ThreadSingle` | `alloc` (`no_std`) | on the calling thread, in order |
+| `ThreadMulti` | `std` | lock-free, on a pool of OS threads started once (`default()`: one per CPU; `from(n)` for `n: NonZeroUsize`); each worker takes the next untaken task; a call waits for the whole pool, so tasks may borrow from the caller |
+
 ## Bits and small syntax
 
 | macro | what |

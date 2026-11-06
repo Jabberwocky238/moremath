@@ -11,6 +11,13 @@ keywords = ["bf16", "f16", "tf32", "float", "bitfield"]
 [dependencies]
 moremath-macros = { path = "macros", version = "=0.2.0" }
 
+[features]
+# `Execute` / `Executor` (`parallel.rs`): a batch of tasks in, their outputs in a `Vec`;
+# `ThreadSingle` (`thread_single.rs`): every task on the calling thread. Still `no_std`.
+alloc = []
+# `ThreadMulti` (`thread_multi.rs`): the same traits, lock-free, over a pool of OS threads.
+std = ["alloc"]
+
 [lints]
 workspace = true
 
