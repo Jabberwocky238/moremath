@@ -15,7 +15,7 @@ impl Executor for ThreadSingle {
     }
 
     #[inline]
-    fn execute<E: Execute>(&self, tasks: Vec<E>) -> Vec<E::Output> {
+    fn execute<'x, 't, E: Execute<'t>>(&'x self, tasks: Vec<E>) -> Vec<E::Output> {
         tasks.into_iter().map(Execute::execute).collect()
     }
 }

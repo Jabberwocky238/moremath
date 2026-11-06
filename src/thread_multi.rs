@@ -61,12 +61,12 @@ impl Executor for ThreadMulti {
         self.pool.len() + 1
     }
 
-    fn execute<E: Execute>(&self, tasks: Vec<E>) -> Vec<E::Output> {
+    fn execute<'x, 't, E: Execute<'t>>(&'x self, tasks: Vec<E>) -> Vec<E::Output> {
         if self.pool.is_empty() || tasks.len() <= 1 || self.running.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             return tasks.into_iter().map(Execute::execute).collect();
         }
         let _running = Running(&self.running);
-        let slots: Vec<Slot<E>> = tasks.into_iter().map(Slot::from).collect();
+        let slots: Vec<Slot<'t, E>> = tasks.into_iter().map(Slot::from).collect();
         let next = AtomicUsize::new(0);
         let work = || {
             while let Some(slot) = slots.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -195,9 +195,9 @@ impl Drop for Running<'_> {
 }
 
 /// A task until a worker runs it, then its output. `fetch_add` hands each slot to one worker.
-struct Slot<E: Execute>(UnsafeCell<Stage<E>>);
+struct Slot<'t, E: Execute<'t>>(UnsafeCell<Stage<'t, E>>);
 
-enum Stage<E: Execute> {
+enum Stage<'t, E: Execute<'t>> {
     Task(E),
     Running,
     Done(E::Output),
@@ -205,16 +205,16 @@ enum Stage<E: Execute> {
 
 // SAFETY: a slot is touched only by the one worker its index was handed to, and read back by
 // the caller only after every worker is done; the task and its output are `Send`.
-unsafe impl<E: Execute> Sync for Slot<E> {}
+unsafe impl<'t, E: Execute<'t>> Sync for Slot<'t, E> {}
 
-impl<E: Execute> From<E> for Slot<E> {
+impl<'t, E: Execute<'t>> From<E> for Slot<'t, E> {
     #[inline]
     fn from(task: E) -> Self {
         Self(UnsafeCell::new(Stage::Task(task)))
     }
 }
 
-impl<E: Execute> Slot<E> {
+impl<'t, E: Execute<'t>> Slot<'t, E> {
     /// Runs the task in place of its output. Only the worker the slot was handed to calls it.
     fn run(&self) {
         // SAFETY: see `Slot`: no other reference to the cell exists while this one does.
