@@ -6,6 +6,7 @@ extern crate alloc;
 extern crate std;
 
 mod bfloat;
+mod cost;
 mod error;
 mod half;
 mod narrow;
@@ -20,6 +21,7 @@ mod trans;
 mod transform;
 
 pub use bfloat::{bf16, TowardZero};
+pub use cost::{Candidates, Cost, Quantity};
 pub use half::f16;
 pub use moremath_macros::{bit, pack, pick};
 pub use narrow::{i4, u1, u4};

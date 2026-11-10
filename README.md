@@ -18,6 +18,13 @@ assert_eq!(transquant!(0x3f80_8000u32, u32 to f32 to bf16 to u16), 0x3f80); // t
 assert_eq!(transquant!(1.0f64 + 1e-9, f64 to bf16 with TowardZero to u16), 0x3f80);
 ```
 
+## Costs
+
+`Cost::cost()` says what something costs as one plain quantity (`Quantity`: anything that adds up and
+compares — `f64`, `u64`, or the implementer's own unit); `Candidates::cheapest_or(rule)` picks the cheapest of
+several ways of doing the same thing, or falls back to the caller's `rule` when any of them cannot be costed.
+What the quantity means is the implementer's business.
+
 ## Running tasks
 
 An `Execute` is one task (any `FnOnce() -> T + Send` is one); an `Executor` runs a `Vec` of them
