@@ -70,7 +70,8 @@ impl Executor for ThreadMulti {
         }
         let batch = Batch::from(tasks);
         // With the table full, the caller runs its batch alone.
-        if let Some(entry) = self.shared.list(&batch.header) {
+        // The header pointer comes from the whole batch, so `help_erased` may reach every field.
+        if let Some(entry) = self.shared.list(ptr::from_ref(&batch).cast::<Header>()) {
             let listed = Listed { shared: &self.shared, entry, batch: &batch };
             for t in &self.pool {
                 t.thread().unpark();
@@ -119,9 +120,10 @@ struct Entry {
 }
 
 impl Shared {
-    /// Lists `batch` in a free entry.
-    fn list(&self, batch: &Header) -> Option<&Entry> {
-        let p = ptr::from_ref(batch).cast_mut();
+    /// Lists `batch` in a free entry. `batch` points at a whole `Batch` (not just its header field),
+    /// so the erased `help` may read the rest of it.
+    fn list(&self, batch: *const Header) -> Option<&Entry> {
+        let p = batch.cast_mut();
         self.entries.iter().find(|e| e.batch.compare_exchange(ptr::null_mut(), p, Ordering::SeqCst, Ordering::Relaxed).is_ok())
     }
 
